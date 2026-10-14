@@ -1,5 +1,7 @@
 """DBES TPAS - shared database helper (Turso with local SQLite fallback)."""
 import sqlite3
+
+import requests
 import streamlit as st
 
 SECTIONS = [
@@ -78,41 +80,82 @@ SCHEMA = [
 ]
 
 
-@st.cache_resource
-def _conn():
-    """Use Turso if secrets exist; otherwise a local SQLite file (testing only)."""
-    try:
-        import libsql_experimental as libsql
-
-        url = st.secrets["TURSO_DATABASE_URL"]
-        token = st.secrets["TURSO_AUTH_TOKEN"]
-        conn = libsql.connect("tpas_replica.db", sync_url=url, auth_token=token)
-        conn.sync()
-        return conn, True
-    except Exception:
-        return sqlite3.connect("tpas_local.db", check_same_thread=False), False
-
-
 def using_turso() -> bool:
-    return _conn()[1]
+    try:
+        st.secrets["TURSO_DATABASE_URL"]
+        st.secrets["TURSO_AUTH_TOKEN"]
+        return True
+    except Exception:
+        return False
+
+
+@st.cache_resource
+def _local():
+    return sqlite3.connect("tpas_local.db", check_same_thread=False)
+
+
+# ---- Turso over plain HTTPS (no compiled packages needed) ----
+def _arg(v):
+    if v is None:
+        return {"type": "null"}
+    if isinstance(v, (bool, int)):
+        return {"type": "integer", "value": str(int(v))}
+    if isinstance(v, float):
+        return {"type": "float", "value": v}
+    return {"type": "text", "value": str(v)}
+
+
+def _val(cell):
+    t = cell.get("type")
+    if t == "null":
+        return None
+    if t == "integer":
+        return int(cell["value"])
+    if t == "float":
+        return float(cell["value"])
+    return cell.get("value")
+
+
+def _pipeline(stmts):
+    url = st.secrets["TURSO_DATABASE_URL"].replace("libsql://", "https://").rstrip("/")
+    headers = {"Authorization": f"Bearer {st.secrets['TURSO_AUTH_TOKEN']}"}
+    reqs = [
+        {"type": "execute", "stmt": {"sql": sql, "args": [_arg(p) for p in params]}}
+        for sql, params in stmts
+    ]
+    reqs.append({"type": "close"})
+    r = requests.post(f"{url}/v2/pipeline", json={"requests": reqs}, headers=headers, timeout=30)
+    r.raise_for_status()
+    out = []
+    for res in r.json()["results"][:-1]:
+        if res["type"] == "error":
+            raise RuntimeError(res["error"]["message"])
+        out.append(res["response"]["result"])
+    return out
 
 
 def run(sql, params=()):
     """SELECT -> list of dicts."""
-    conn, _ = _conn()
-    cur = conn.execute(sql, params)
+    if using_turso():
+        res = _pipeline([(sql, params)])[0]
+        cols = [c["name"] for c in res["cols"]]
+        return [dict(zip(cols, [_val(c) for c in row])) for row in res["rows"]]
+    cur = _local().execute(sql, params)
     cols = [d[0] for d in cur.description] if cur.description else []
     return [dict(zip(cols, r)) for r in cur.fetchall()]
 
 
 def write(statements):
-    """Run a list of (sql, params) in one transaction."""
-    conn, remote = _conn()
+    """Run a list of (sql, params) in one transaction. Returns last-insert id of each statement."""
+    if using_turso():
+        res = _pipeline([("BEGIN", ())] + list(statements) + [("COMMIT", ())])
+        return [int(r["last_insert_rowid"]) if r.get("last_insert_rowid") else None for r in res[1:-1]]
+    conn = _local()
+    ids = []
     for sql, params in statements:
-        conn.execute(sql, params)
+        ids.append(conn.execute(sql, params).lastrowid)
     conn.commit()
-    if remote:
-        conn.sync()
+    return ids
 
 
 @st.cache_resource

@@ -54,12 +54,11 @@ if submitted:
     elif missing:
         st.error(f"Please rate all statements ({len(missing)} not yet answered).")
     else:
-        write([(
+        eval_id = write([(
             "INSERT INTO tpas_evaluations (sy, school, teacher_name, comment_strategy, comment_classroom, comment_others) "
             "VALUES (?, ?, ?, ?, ?, ?)",
             (sy.strip(), school.strip(), teacher.strip(), c_strategy.strip(), c_classroom.strip(), c_others.strip()),
-        )])
-        eval_id = run("SELECT MAX(id) AS id FROM tpas_evaluations")[0]["id"]
+        )])[0]
         write([
             ("INSERT INTO tpas_answers (evaluation_id, question_id, rating) VALUES (?, ?, ?)",
              (eval_id, q["id"], int(st.session_state[f"q_{q['id']}"])))
